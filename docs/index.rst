@@ -128,6 +128,7 @@ Section listing
    setutils
    socketutils
    statsutils
+   weightedstats
    strutils
    tableutils
    tbutils
