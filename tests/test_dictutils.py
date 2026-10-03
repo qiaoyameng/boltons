@@ -1,7 +1,12 @@
 import sys
 import pytest
 
-from boltons.dictutils import OMD, OneToOne, ManyToMany, FrozenDict, subdict, FrozenHashError
+from boltons.dictutils import (OMD, OneToOne, ManyToMany, FrozenDict,
+                               subdict, FrozenHashError,
+                               FastIterOrderedMultiDict)
+
+
+_SPLICE_CLASSES = (OMD, FastIterOrderedMultiDict)
 
 
 _ITEMSETS = [[],
@@ -599,3 +604,177 @@ def test_frozendict_api():
 
     import copy
     assert copy.copy(fd) is fd
+
+
+#
+# OrderedMultiDict.splice
+#
+
+def test_splice_interleaved_replace():
+    # duplicate keys interleaved with other keys; positions are by
+    # occurrence of the single key, but new values land at the first
+    # removed cell in the global stream
+    for cls in _SPLICE_CLASSES:
+        omd = cls([('a', 1), ('b', 2), ('a', 3), ('c', 4), ('a', 5)])
+        removed = omd.splice('a', 1, 3, values=[6])
+        assert removed == [3, 5]
+        assert omd.items(multi=True) == [('a', 1), ('b', 2),
+                                         ('a', 6), ('c', 4)]
+        assert omd.getlist('a') == [1, 6]
+        assert omd['a'] == 6
+        assert omd['b'] == 2
+        assert omd['c'] == 4
+
+
+def test_splice_replacement_lengths():
+    for cls in _SPLICE_CLASSES:
+        # more replacements than removed
+        omd = cls([('a', 1), ('b', 2), ('a', 3)])
+        assert omd.splice('a', 1, 2, values=[4, 5, 6]) == [3]
+        assert omd.items(multi=True) == [('a', 1), ('b', 2),
+                                         ('a', 4), ('a', 5), ('a', 6)]
+
+        # fewer replacements than removed
+        omd = cls([('a', 1), ('b', 2), ('a', 3), ('c', 4), ('a', 5)])
+        assert omd.splice('a', 0, 3, values=[9]) == [1, 3, 5]
+        assert omd.items(multi=True) == [('a', 9), ('b', 2), ('c', 4)]
+
+        # plain deletion with no replacements
+        omd = cls([('a', 1), ('b', 2), ('a', 3)])
+        assert omd.splice('a', 0, 1) == [1]
+        assert omd.items(multi=True) == [('b', 2), ('a', 3)]
+
+
+def test_splice_empty_range_insert():
+    for cls in _SPLICE_CLASSES:
+        # at index 0: before the first occurrence cell, not global head
+        omd = cls([('a', 1), ('b', 2), ('a', 3), ('c', 4), ('a', 5)])
+        assert omd.splice('c', 0, 0, values=[7, 8]) == []
+        assert omd.items(multi=True) == [
+            ('a', 1), ('b', 2), ('a', 3),
+            ('c', 7), ('c', 8), ('c', 4), ('a', 5)]
+        assert omd.getlist('c') == [7, 8, 4]
+
+        # in the middle: before the occurrence cell at the start index
+        omd = cls([('a', 1), ('c', 2), ('b', 3), ('c', 4)])
+        assert omd.splice('c', 1, 1, values=[9]) == []
+        assert omd.items(multi=True) == [
+            ('a', 1), ('c', 2), ('b', 3), ('c', 9), ('c', 4)]
+
+        # at the end index: after the final occurrence cell
+        omd = cls([('a', 1), ('b', 2), ('a', 3), ('c', 4)])
+        assert omd.splice('a', 2, 2, values=[9]) == []
+        assert omd.items(multi=True) == [
+            ('a', 1), ('b', 2), ('a', 3), ('a', 9), ('c', 4)]
+
+        # a start clipped up to count with an empty range anchors after
+        # the final occurrence cell, not at the global end
+        omd = cls([('a', 1), ('b', 2), ('c', 3)])
+        assert omd.splice('c', 5, 1, values=[9]) == []
+        assert omd.items(multi=True) == [
+            ('a', 1), ('b', 2), ('c', 3), ('c', 9)]
+
+
+def test_splice_slice_rules():
+    for cls in _SPLICE_CLASSES:
+        # omitted stop extends to the end
+        omd = cls([('a', 1), ('b', 2), ('a', 3), ('c', 4), ('a', 5)])
+        assert omd.splice('a', 1) == [3, 5]
+        assert omd.items(multi=True) == [('a', 1), ('b', 2), ('c', 4)]
+
+        # negative index
+        omd = cls([('a', 1), ('b', 2), ('a', 3)])
+        assert omd.splice('a', -1) == [3]
+        assert omd.items(multi=True) == [('a', 1), ('b', 2)]
+
+        omd = cls([('a', 1), ('b', 2), ('a', 3)])
+        assert omd.splice('a', -1, -1, values=[9]) == []
+        assert omd.items(multi=True) == [
+            ('a', 1), ('b', 2), ('a', 9), ('a', 3)]
+
+        # out-of-range indices are clipped
+        omd = cls([('a', 1), ('b', 2), ('a', 3)])
+        assert omd.splice('a', 10, 20) == []
+        assert omd.items(multi=True) == [('a', 1), ('b', 2), ('a', 3)]
+
+        omd = cls([('a', 1), ('b', 2), ('a', 3)])
+        assert omd.splice('a', -10, values=[9]) == [1, 3]
+        assert omd.items(multi=True) == [('a', 9), ('b', 2)]
+
+
+def test_splice_missing_key_and_empty():
+    for cls in _SPLICE_CLASSES:
+        omd = cls([('a', 1), ('b', 2)])
+        assert omd.splice('z', 0, 0, values=[9]) == []
+        assert omd.items(multi=True) == [('a', 1), ('b', 2), ('z', 9)]
+
+        omd = cls()
+        assert omd.splice('z', 0, 0, values=[1, 2]) == []
+        assert omd.items(multi=True) == [('z', 1), ('z', 2)]
+
+
+def test_splice_consistency():
+    import pickle
+    import copy
+
+    for cls in _SPLICE_CLASSES:
+        omd = cls([('a', 1), ('b', 2), ('a', 3), ('c', 4),
+                   ('b', 5), ('a', 6)])
+        omd.splice('b', 0, 1, values=[7, 8])
+        expected = [('a', 1), ('b', 7), ('b', 8), ('a', 3),
+                    ('c', 4), ('b', 5), ('a', 6)]
+        assert omd.items(multi=True) == expected
+
+        # reads
+        assert omd.getlist('b') == [7, 8, 5]
+        assert omd['b'] == 5
+        assert omd.values(multi=True) == [v for _, v in expected]
+        assert omd.keys(multi=True) == [k for k, _ in expected]
+        assert list(omd) == ['a', 'b', 'c']
+        assert list(reversed(omd)) == ['c', 'b', 'a']
+
+        # copy
+        omd_copy = omd.copy()
+        assert isinstance(omd_copy, cls)
+        assert omd_copy == omd
+        assert omd_copy.items(multi=True) == expected
+
+        # copy module
+        assert copy.copy(omd).items(multi=True) == expected
+        assert copy.deepcopy(omd).items(multi=True) == expected
+
+        # pickle round trip
+        restored = pickle.loads(pickle.dumps(omd))
+        assert isinstance(restored, cls)
+        assert restored == omd
+        assert restored.items(multi=True) == expected
+        assert restored.getlist('a') == [1, 3, 6]
+        assert restored.getlist('b') == [7, 8, 5]
+
+
+def test_splice_iterator_error_is_atomic():
+    # a values iterator that raises partway through must not leave the
+    # OMD half-modified
+    class Boom(Exception):
+        pass
+
+    def bad_values():
+        yield 100
+        raise Boom()
+
+    for cls in _SPLICE_CLASSES:
+        omd = cls([('a', 1), ('b', 2), ('a', 3), ('c', 4), ('a', 5)])
+        before = omd.items(multi=True)
+        with pytest.raises(Boom):
+            omd.splice('a', 1, 3, values=bad_values())
+        assert omd.items(multi=True) == before
+        assert omd.getlist('a') == [1, 3, 5]
+        assert list(omd) == ['a', 'b', 'c']
+        assert list(reversed(omd)) == ['c', 'b', 'a']
+
+
+def test_splice_empty_values_no_state_change():
+    for cls in _SPLICE_CLASSES:
+        omd = cls([('a', 1), ('b', 2), ('a', 3)])
+        assert omd.splice('a', 0, 0, values=()) == []
+        assert omd.items(multi=True) == [('a', 1), ('b', 2), ('a', 3)]

@@ -433,6 +433,97 @@ class OrderedMultiDict(dict):
             super().__delitem__(k)
         return v
 
+    def splice(self, key, start, stop=_MISSING, values=()):
+        """Replace a range of occurrences of *key* with *values*, where the
+        range is indexed into the occurrences of *key* only (not into
+        the global insertion order). Returns a list of the removed
+        values. The new values are spliced in at the position of the
+        first removed occurrence (or the position indicated by an
+        empty range), so other keys keep their relative positions.
+
+        *start* and *stop* follow the rules of Python slice indices:
+        negative indices count back from the last occurrence, omitted
+        bounds extend to the ends, and out-of-range indices are
+        clipped. An empty range (``start == stop``) inserts without
+        removing anything. A *step* is not supported yet.
+
+        >>> omd = OrderedMultiDict(
+        ...     [('a', 1), ('b', 2), ('a', 3), ('c', 4), ('a', 5)])
+        >>> omd.splice('a', 1, 3, values=[6])
+        [3, 5]
+        >>> omd
+        OrderedMultiDict([('a', 1), ('b', 2), ('a', 6), ('c', 4)])
+
+        Empty ranges insert right before the occurrence cell at the
+        start index, so other keys interleaved between occurrences
+        stay put rather than the new values going to the global end:
+
+        >>> omd.splice('c', 0, 0, values=[7])
+        []
+        >>> omd
+        OrderedMultiDict([('a', 1), ('b', 2), ('a', 6), ('c', 7), ('c', 4)])
+        >>> omd.splice('a', 1, 1, values=[8, 9])
+        []
+        >>> omd
+        OrderedMultiDict([('a', 1), ('b', 2), ('a', 8), ('a', 9), ('a', 6), ('c', 7), ('c', 4)])
+        """
+        if stop is _MISSING:
+            stop = None
+        # Materialize everything up front so that a failing iterator
+        # cannot leave the OMD half-modified.
+        new_values = list(values)
+        old_items = self.items(multi=True)
+        if key in self:
+            occ = super().__getitem__(key)
+            count = len(occ)
+            lo, hi, _ = slice(start, stop).indices(count)
+            removed = occ[lo:hi]
+        else:
+            count = 0
+            lo, hi, _ = slice(start, stop).indices(0)
+            removed = []
+
+        new_items = []
+        new_extend = new_items.extend
+        occ_index = 0
+        new_pairs = [(key, new_v) for new_v in new_values]
+        inserted = False
+        for k, v in old_items:
+            if k == key:
+                if lo <= occ_index < hi:
+                    if not inserted:
+                        # Replace at the first removed cell's position.
+                        new_extend(new_pairs)
+                        inserted = True
+                elif occ_index == lo:
+                    # Empty range: right before this occurrence cell.
+                    new_extend(new_pairs)
+                    inserted = True
+                    new_items.append((k, v))
+                else:
+                    new_items.append((k, v))
+                occ_index += 1
+                if not inserted and lo == hi == count and occ_index == count:
+                    # Empty range at the end index: right after the
+                    # final occurrence cell.
+                    new_extend(new_pairs)
+                    inserted = True
+            else:
+                new_items.append((k, v))
+        if not inserted:
+            # Missing key or empty OMD: no anchor cell, append at end.
+            new_extend(new_pairs)
+
+        # Rebuild via the same class so both backing representations
+        # stay consistent, then swap state in atomically.
+        rebuilt = self.__class__(new_items)
+        dict.clear(self)
+        for k, v_list in dict.items(rebuilt):
+            dict.__setitem__(self, k, v_list)
+        self._map = rebuilt._map
+        self.root = rebuilt.root
+        return removed
+
     def _remove(self, k):
         values = self._map[k]
         cell = values.pop()
