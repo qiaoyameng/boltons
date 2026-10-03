@@ -331,3 +331,187 @@ def test_small_difference_update_unchanged():
     thing = IndexedSet(range(100))
     thing.difference_update({1, 3, 5})
     assert list(thing)[:5] == [0, 2, 4, 6, 7]
+
+
+def _ref_move(seq, start, stop, destination):
+    # plain-list reference for IndexedSet.move_range semantics: slice-style
+    # clipping, pre-move destination boundary, self/empty range is a no-op
+    items = list(seq)
+    n = len(items)
+
+    def clip(value):
+        if value < 0:
+            value += n
+        return min(max(value, 0), n)
+
+    start, stop, destination = clip(start), clip(stop), clip(destination)
+    if start >= stop or start <= destination <= stop:
+        return items
+    moved = items[start:stop]
+    if destination < start:
+        return (items[:destination] + moved
+                + items[destination:start] + items[stop:])
+    return (items[:start] + items[stop:destination]
+            + moved + items[destination:])
+
+
+def test_iset_move_range_basic():
+    iset = IndexedSet(range(6))
+
+    assert iset.move_range(1, 3, 4) is None  # [1, 2] before 4
+    assert list(iset) == [0, 3, 1, 2, 4, 5]
+
+    assert iset.move_range(2, 4, 0) is None  # move to the front
+    assert list(iset) == [1, 2, 0, 3, 4, 5]
+
+    assert iset.move_range(0, 2, 6) is None  # move to the end
+    assert list(iset) == [0, 3, 4, 5, 1, 2]
+
+
+def test_iset_move_range_boundaries_and_empty():
+    original = list(range(6))
+
+    # destination at/inside the moved range, including both adjacent
+    # boundaries, and empty ranges are all no-ops
+    for start, stop, destination in ((2, 4, 2), (2, 4, 3), (2, 4, 4),
+                                     (0, 0, 3), (3, 3, 0), (4, 2, 1)):
+        iset = IndexedSet(original)
+        assert iset.move_range(start, stop, destination) is None
+        assert list(iset) == original
+
+    # destination just beyond the range actually moves
+    iset = IndexedSet(original)
+    iset.move_range(1, 3, 3)
+    assert list(iset) == original  # == stop, no-op
+    iset.move_range(1, 3, 4)
+    assert list(iset) == [0, 3, 1, 2, 4, 5]
+
+    # negative indices
+    iset = IndexedSet(range(6))
+    iset.move_range(0, 2, -1)
+    assert list(iset) == [2, 3, 4, 0, 1, 5]
+    iset = IndexedSet(range(6))
+    iset.move_range(-2, 6, 0)
+    assert list(iset) == [4, 5, 0, 1, 2, 3]
+
+    # empty set
+    empty = IndexedSet()
+    assert empty.move_range(0, 0, 0) is None
+    assert empty.move_range(-5, 50, 2) is None
+    assert list(empty) == []
+
+
+def test_iset_move_range_out_of_range_clipping():
+    # bounds clip like list slices instead of raising
+    iset = IndexedSet(range(6))
+    iset.move_range(-100, 2, 3)
+    assert list(iset) == [2, 0, 1, 3, 4, 5]
+
+    iset = IndexedSet(range(6))
+    iset.move_range(4, 100, 0)
+    assert list(iset) == [4, 5, 0, 1, 2, 3]
+
+    iset = IndexedSet(range(6))
+    iset.move_range(0, 2, 100)  # clips to the end boundary
+    assert list(iset) == [2, 3, 4, 5, 0, 1]
+
+    iset = IndexedSet(range(6))
+    iset.move_range(4, 6, -100)  # clips to the front boundary
+    assert list(iset) == [4, 5, 0, 1, 2, 3]
+
+    with raises(TypeError):
+        IndexedSet(range(6)).move_range(1.5, 3, 0)
+
+
+@mark.parametrize('removed', ([], [50], [10, 45], [5, 25, 50]))
+def test_iset_move_range_matches_list_reference(removed):
+    bounds = (-100, -70, -9, -3, -1, 0, 1, 2, 5, 8, 9, 50, 63, 64, 100)
+    pops = removed
+    seq = [x for x in range(64) if x not in set(pops)]
+    for start in bounds:
+        for stop in bounds:
+            for destination in bounds:
+                iset = IndexedSet(range(64))
+                for value in pops:
+                    iset.discard(value)
+                had_dead_slots = bool(iset.dead_indices)
+
+                iset.move_range(start, stop, destination)
+                expected = _ref_move(seq, start, stop, destination)
+                assert list(iset) == expected, (pops, start, stop,
+                                                destination)
+                if expected != seq:
+                    # actual move: holes are compacted regardless of
+                    # pre-existing dead slots
+                    assert iset.dead_indices == []
+                    assert iset._dead_index_count == 0
+                if had_dead_slots:
+                    # same result as a dead-slot-free copy moved identically
+                    fresh = IndexedSet(seq)
+                    fresh.move_range(start, stop, destination)
+                    assert list(fresh) == expected
+
+
+def test_iset_move_range_preserves_identity_and_membership():
+    items = [object() for _ in range(6)]
+    iset = IndexedSet(items)
+    before = list(iset)
+
+    iset.pop(2)  # leave a dead slot before moving
+    iset.move_range(0, 2, 3)
+
+    after = list(iset)
+    expected = [before[3], before[0], before[1], before[4], before[5]]
+    assert all(got is want for got, want in zip(after, expected))
+    assert {id(x) for x in after} == {id(x) for x in before if x is not
+                                      before[2]}
+    assert len(iset) == len(after) == len(set(after))
+
+
+def test_iset_move_range_after_heavy_deletion():
+    iset = IndexedSet(range(1000))
+    ref = list(range(1000))
+
+    for value in range(0, 600, 2):  # many individual pops force compactions
+        iset.remove(value)
+    ref = [value for value in ref if value not in range(0, 600, 2)]
+    assert iset._compactions >= 1
+
+    iset.move_range(100, 300, 0)
+    ref = _ref_move(ref, 100, 300, 0)
+    assert list(iset) == ref
+    assert iset.dead_indices == []
+
+
+def test_iset_move_range_mixed_operations():
+    # chained index/pop/slice/reversed/update sequence must stay in
+    # lockstep with the equivalent operations on a plain list
+    iset = IndexedSet(range(24))
+    ref = list(range(24))
+
+    for value in (3, 7, 11):
+        iset.remove(value)
+        ref.remove(value)
+    assert iset.dead_indices  # holes present
+
+    iset.move_range(2, 8, 0)
+    ref = _ref_move(ref, 2, 8, 0)
+    assert list(iset) == ref
+
+    assert iset.index(ref[4]) == ref.index(ref[4])
+    assert iset.pop(1) == ref.pop(1)
+    assert list(iset[2:6]) == ref[2:6]
+    assert list(iset[-4:]) == ref[-4:]
+    assert list(reversed(iset)) == list(reversed(ref))
+
+    iset.update([99, ref[0], 5])
+    for value in (99, ref[0], 5):
+        if value not in ref:
+            ref.append(value)
+    assert list(iset) == ref
+
+    iset.move_range(0, 3, -1)
+    ref = _ref_move(ref, 0, 3, -1)
+    assert list(iset) == ref
+    assert set(iset) == set(ref)
+    assert list(iset[::-1]) == ref[::-1]

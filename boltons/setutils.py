@@ -483,6 +483,71 @@ class IndexedSet(MutableSet):
             self.item_index_map[item] = i
         del self.dead_indices[:]
 
+    def move_range(self, start, stop, destination):
+        """move_range(start, stop, destination) -> move the ``[start, stop)``
+        slice so that it starts at *destination*.
+
+        The bounds are logical positions, interpreted like a slice:
+        negatives count from the end and out-of-range bounds are clipped
+        rather than raising. *destination* is the insertion boundary
+        measured **before** anything moves, in the same index space (0 is
+        the front, ``len(self)`` is just past the end); negatives count
+        from the end and out-of-range values are clipped to the ends.
+
+        Moving into the range itself (``start <= destination <= stop``)
+        or moving an empty range leaves the set unchanged. Elements are
+        never copied or duplicated: only their order changes, object
+        identity and membership are preserved, and any dead slots left
+        by earlier removals are compacted away.
+
+        Returns ``None`` (like :meth:`list.sort` and :meth:`reverse`).
+
+        >>> x = IndexedSet(range(6))
+        >>> x.move_range(1, 3, 4)  # move [1, 2] before 4
+        >>> list(x)
+        [0, 3, 1, 2, 4, 5]
+        >>> x.move_range(0, 0, 3)  # empty range: no-op
+        >>> list(x)
+        [0, 3, 1, 2, 4, 5]
+        >>> x.move_range(2, 4, 2)  # moving within itself: no-op
+        >>> list(x)
+        [0, 3, 1, 2, 4, 5]
+        """
+        start, stop, destination = map(operator.index,
+                                       (start, stop, destination))
+        size = len(self)
+
+        if start < 0:
+            start = max(size + start, 0)
+        else:
+            start = min(start, size)
+        if stop < 0:
+            stop = max(size + stop, 0)
+        else:
+            stop = min(stop, size)
+        if start >= stop:
+            return
+
+        if destination < 0:
+            destination = max(size + destination, 0)
+        else:
+            destination = min(destination, size)
+        if start <= destination <= stop:
+            return
+
+        order = list(self)
+        moved = order[start:stop]
+        if destination < start:
+            new_order = (order[:destination] + moved
+                         + order[destination:start] + order[stop:])
+        else:
+            new_order = (order[:start] + order[stop:destination]
+                         + moved + order[destination:])
+
+        self.item_list = new_order
+        self.item_index_map = {item: i for i, item in enumerate(new_order)}
+        del self.dead_indices[:]
+
     def index(self, val):
         "index(val) -> get the index of a value, raises if not present"
         try:
