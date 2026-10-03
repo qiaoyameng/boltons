@@ -136,6 +136,114 @@ class TestRemap:
         assert remapped[0] is remapped[1]
         assert remapped[0] is not duperef[0]
 
+    def test_pathwise_shared_container(self):
+        shared = {'kind': 'shared', 'secret': 'internal-only'}
+        root = {'public': shared, 'internal': shared}
+
+        def visit(path, key, value):
+            if path == ('public',) and key == 'secret':
+                return False
+            return key, value
+
+        cached = remap(root, visit=visit)
+        assert cached['public'] is cached['internal']
+
+        pathwise = remap(root, visit=visit, pathwise=True)
+        assert pathwise['public'] is not pathwise['internal']
+        assert pathwise['public'] == {'kind': 'shared'}
+        assert pathwise['internal'] == shared
+
+    def test_pathwise_cross_cycle(self):
+        cycle = []
+        mapping = {'back': cycle}
+        cycle.append(mapping)
+
+        remapped = remap({'cycle': cycle}, pathwise=True)
+        assert remapped['cycle'][0] is not mapping
+        assert remapped['cycle'][0]['back'] is remapped['cycle']
+
+    def test_pathwise_custom_exit_replaces_backreference(self):
+        class BuilderList(list):
+            pass
+
+        class ResultList(list):
+            pass
+
+        cycle = []
+        mapping = {'back': cycle}
+        cycle.append(mapping)
+        builder = None
+
+        def enter(path, key, value):
+            nonlocal builder
+            if value is cycle:
+                builder = BuilderList()
+                return builder, enumerate(value)
+            return default_enter(path, key, value)
+
+        def exit(path, key, old_parent, new_parent, new_items):
+            if old_parent is cycle:
+                replaced = ResultList(('wrapper',))
+                replaced.extend(value for index, value in new_items)
+                return replaced
+            return default_exit(path, key, old_parent, new_parent, new_items)
+
+        result = remap(cycle, enter=enter, exit=exit, pathwise=True)
+
+        assert isinstance(result, ResultList)
+        assert result[1]['back'] is result
+
+        seen = set()
+        stack = [result]
+        while stack:
+            value = stack.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            assert value is not builder
+            if isinstance(value, dict):
+                stack.extend(value.keys())
+                stack.extend(value.values())
+            elif isinstance(value, list):
+                stack.extend(value)
+
+    def test_pathwise_immutable_root_backreference(self):
+        class ImmutableRoot(tuple):
+            pass
+
+        cycle = []
+        mapping = {'back': cycle}
+        cycle.append(mapping)
+
+        def enter(path, key, value):
+            if value is cycle:
+                return ImmutableRoot(), enumerate(value)
+            return default_enter(path, key, value)
+
+        result = remap(cycle, enter=enter, pathwise=True)
+
+        assert isinstance(result, ImmutableRoot)
+        assert result[0]['back'] is result
+
+    def test_pathwise_visit_failure_leaves_source_usable(self):
+        source = []
+        mapping = {'back': source}
+        source.append(mapping)
+
+        def visit(path, key, value):
+            if path == (0,) and key == 'back':
+                raise RuntimeError('failed callback')
+            return key, value
+
+        with pytest.raises(RuntimeError):
+            remap(source, visit=visit, pathwise=True)
+
+        assert source[0] is mapping
+        assert mapping['back'] is source
+        assert source == [mapping]
+        cloned = remap(source)
+        assert cloned[0]['back'] is cloned
+
     def test_namedtuple(self):
         """TODO: this fails right now because namedtuples' __new__ is
         overridden to accept arguments. remap's default_enter tries

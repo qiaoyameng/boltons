@@ -1095,12 +1095,89 @@ def default_exit(path, key, old_parent, new_parent, new_items):
     return ret
 
 
+def _replace_backreference(value, old, new, seen=None, top_level=False):
+    if value is old:
+        return new
+    if seen is None:
+        seen = set()
+    elif id(value) in seen:
+        return value
+    seen.add(id(value))
+
+    if isinstance(value, Mapping):
+        for old_key in list(value.keys()):
+            old_value = value[old_key]
+            repl_key = _replace_backreference(
+                old_key, old, new, seen, top_level)
+            repl_value = _replace_backreference(
+                old_value, old, new, seen, top_level)
+            if repl_key is not old_key:
+                del value[old_key]
+                value[repl_key] = repl_value
+            elif repl_value is not old_value:
+                value[old_key] = repl_value
+    elif isinstance(value, (str, bytes)):
+        pass
+    elif isinstance(value, tuple):
+        if top_level:
+            for item in value:
+                _replace_backreference(item, old, new, seen, top_level)
+        else:
+            return type(value)(
+                _replace_backreference(item, old, new, seen)
+                for item in value
+            )
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _replace_backreference(
+                item, old, new, seen, top_level)
+    elif isinstance(value, Sequence):
+        if not hasattr(value, '__setitem__'):
+            if not top_level:
+                return type(value)(
+                    _replace_backreference(item, old, new, seen)
+                    for item in value
+                )
+            for item in value:
+                _replace_backreference(item, old, new, seen, top_level)
+        else:
+            for index, item in enumerate(value):
+                value[index] = _replace_backreference(
+                    item, old, new, seen, top_level)
+    elif isinstance(value, frozenset):
+        if top_level:
+            for item in value:
+                _replace_backreference(item, old, new, seen, top_level)
+        else:
+            return type(value)(
+                _replace_backreference(item, old, new, seen)
+                for item in value
+            )
+    elif isinstance(value, set):
+        for item in list(value):
+            repl = _replace_backreference(
+                item, old, new, seen, top_level)
+            if repl is not item:
+                value.remove(item)
+                value.add(repl)
+    elif isinstance(value, Set):
+        replaced = {
+            _replace_backreference(item, old, new, seen, top_level)
+            for item in value
+        }
+        if any(repl is not item for repl, item in zip(replaced, value)):
+            value.clear()
+            value.update(replaced)
+    return value
+
+
 def remap(
         root,
         visit=default_visit,
         enter=default_enter,
         exit=default_exit,
         cache: bool = True,
+        pathwise: bool = False,
         **kwargs,
 ):
     """The remap ("recursive map") function is used to traverse and
@@ -1180,6 +1257,19 @@ def remap(
             objects. Uses object identity for the cache. For example
             this is turned off for applications like `research` which
             need to traverse all trees.
+        pathwise (bool): When true, only objects on the current
+            ancestor chain are cached. Shared containers outside that
+            chain are traversed separately for every path, and
+            *visit*, *enter*, and *exit* are called separately for
+            each traversal. References to an ancestor resolve to that
+            ancestor's in-progress result and are not traversed again.
+            If *exit* replaces the object returned by *enter*, that
+            replacement becomes the ancestor result. Backreferences in
+            supported built-in containers are redirected before the
+            replacement is returned. Custom *exit* callbacks must
+            construct the replacement so it carries those
+            backreferences rather than leaving the half-constructed
+            placeholder reachable.
         reraise_visit (bool): A pragmatic convenience for the *visit*
             callable. When set to ``False``, remap ignores any errors
             raised by the *visit* callback. Items causing exceptions
@@ -1242,10 +1332,17 @@ def remap(
             value = exit(path, key, old_parent, new_parent, new_items)
             if trace_exit:
                 print(' .. remap exit result:', value)
-            registry[id_value] = value
+            if pathwise:
+                if value is not new_parent:
+                    value = _replace_backreference(
+                        value, new_parent, value, top_level=True
+                    )
+                registry.pop(id_value, None)
+            else:
+                registry[id_value] = value
             if not new_items_stack:
                 continue
-        elif cache and id_value in registry:
+        elif (cache or pathwise) and id_value in registry:
             value = registry[id_value]
         else:
             if trace_enter:
