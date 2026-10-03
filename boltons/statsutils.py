@@ -116,8 +116,10 @@ Unrelated to computer networking, `online`_ statistics involve
 calculating statistics in a `streaming`_ fashion, without all the data
 being available. The :class:`Stats` type is meant for the more
 traditional offline statistics when all the data is available. For
-pure-Python online statistics accumulators, look at the `Lithoxyl`_
-system instrumentation package.
+pure-Python online statistics, :class:`OnlineWeightedStats` retains
+only weighted moments instead of retaining all observations. For more
+system instrumentation-oriented accumulators, look at the `Lithoxyl`_
+package.
 
 .. _Online: https://en.wikipedia.org/wiki/Online_algorithm
 .. _streaming: https://en.wikipedia.org/wiki/Streaming_algorithm
@@ -127,8 +129,10 @@ system instrumentation package.
 
 
 import bisect
-from math import floor, ceil
+import sys
 from collections import Counter
+from math import floor, ceil, isfinite
+from numbers import Real
 
 
 class _StatsProperty:
@@ -754,6 +758,353 @@ class Stats:
             ret = '\n'.join(['{}{}'.format((label + ':').ljust(10), val)
                              for label, val in items])
         return ret
+
+
+class OnlineWeightedStats:
+    """Incremental accumulator for weighted values.
+
+    Unlike :class:`Stats`, this object never stores the input samples.
+    It retains only the total weight, weighted mean, and weighted
+    second central moment (``m2``). Values and weights must be finite
+    real numbers; weights must be nonnegative. A zero-weight sample is
+    ignored.
+
+    The update and merge formulas are weighted forms of Welford's and
+    Chan's parallel moment formulas. They keep each calculation around
+    the relevant mean or difference between means, rather than
+    subtracting two large sums of squares.
+
+    Two variance conventions are available:
+
+    * Population variance is ``m2 / total_weight``.
+    * Sample variance is ``m2 / (total_weight - 1)``; it supports
+      frequency weights, i.e. weights representing the amount that each
+      value is repeated. For other weighted-survey conventions, use the
+      population moment and apply that convention separately.
+
+    Operations are validated before changing the accumulator. Removing
+    a weight larger than the accumulated total, or removing a sample
+    that would produce a clearly negative second central moment,
+    raises :class:`ValueError`.
+
+    Floating-point calculations can make a mathematically zero moment
+    appear slightly negative. Add and merge use a ``1e-12`` relative
+    tolerance. Undo also uses scale-dependent machine-epsilon bounds to
+    absorb roundoff accumulated by a reverse update chain, and allows a
+    ``1e-12`` absolute floor when the final sample empties the
+    accumulator.
+
+    >>> stats = OnlineWeightedStats()
+    >>> stats.add(2.0, 0.5).add(4.0, 1.5)
+    OnlineWeightedStats(total_weight=2.0, mean=3.5, m2=1.5)
+    >>> stats.population_variance()
+    0.75
+    >>> stats.sample_variance()
+    1.5
+    """
+
+    _EPSILON = 1e-12
+
+    def __init__(self, values=(), weights=None):
+        self._reset()
+        if weights is None:
+            self.extend(values)
+        else:
+            self.extend(values, weights)
+
+    def _reset(self):
+        self._total_weight = 0.0
+        self._mean = 0.0
+        self._m2 = 0.0
+
+    @property
+    def total_weight(self):
+        """Sum of all nonzero sample weights."""
+        return self._total_weight
+
+    @property
+    def mean(self):
+        """Weighted mean, or ``0.0`` for an empty accumulator."""
+        return self._mean
+
+    @property
+    def m2(self):
+        """Weighted sum of squared deviations from the weighted mean."""
+        return self._m2
+
+    @property
+    def central_moment_2(self):
+        """Alias for :attr:`m2`."""
+        return self._m2
+
+    @staticmethod
+    def _finite_real(value, name):
+        if not isinstance(value, Real):
+            raise TypeError('expected %s to be a real number, not %r'
+                            % (name, value))
+        value = float(value)
+        if not isfinite(value):
+            raise ValueError('expected %s to be finite, not %r'
+                             % (name, value))
+        return value
+
+    @classmethod
+    def _sample(cls, value, weight):
+        value = cls._finite_real(value, 'value')
+        weight = cls._finite_real(weight, 'weight')
+        if weight < 0.0:
+            raise ValueError('expected weight to be nonnegative, not %r'
+                             % weight)
+        return value, weight
+
+    @classmethod
+    def _m2_tolerance(cls, *terms):
+        scales = [abs(float(term)) for term in terms]
+        return cls._EPSILON * (max(scales) if scales else 0.0)
+
+    def extend(self, values, weights=1.0):
+        """Add every value in *values*.
+
+        When *weights* is a scalar, it is used for every value.
+        Otherwise, *values* and *weights* are zipped together.
+        """
+        if isinstance(weights, Real):
+            for value in values:
+                self.add(value, weights)
+        else:
+            for value, weight in zip(values, weights):
+                self.add(value, weight)
+        return self
+
+    def add(self, value, weight=1.0):
+        """Add one weighted sample using weighted Welford updates."""
+        value, weight = self._sample(value, weight)
+        if weight == 0.0:
+            return self
+
+        old_weight = self._total_weight
+        new_weight = old_weight + weight
+        if old_weight == 0.0:
+            new_mean = value
+            new_m2 = 0.0
+        else:
+            old_delta = value - self._mean
+            new_mean = self._mean + old_delta * weight / new_weight
+            new_delta = value - new_mean
+            contribution = weight * old_delta * new_delta
+            new_m2 = self._m2 + contribution
+            tolerance = self._m2_tolerance(self._m2, contribution)
+            if new_m2 < 0.0:
+                if new_m2 >= -tolerance:
+                    new_m2 = 0.0
+                else:
+                    raise ValueError('update produced a negative second '
+                                     'central moment: %r' % new_m2)
+
+        if not (isfinite(new_weight) and isfinite(new_mean)
+                and isfinite(new_m2)):
+            raise ValueError('update produced non-finite state')
+
+        self._total_weight = new_weight
+        self._mean = new_mean
+        self._m2 = new_m2
+        return self
+
+    update = add
+    append = add
+
+    @classmethod
+    def _state_from(cls, obj):
+        try:
+            weight = obj.total_weight
+            mean = obj.mean
+            m2 = obj.m2
+        except AttributeError:
+            raise TypeError('expected an OnlineWeightedStats-compatible '
+                            'object, not %r' % obj)
+
+        weight = cls._finite_real(weight, 'total_weight')
+        mean = cls._finite_real(mean, 'mean')
+        m2 = cls._finite_real(m2, 'm2')
+        if weight < 0.0:
+            raise ValueError('shard total weight must be nonnegative')
+        if weight == 0.0 and m2 != 0.0:
+            raise ValueError('empty shard must have zero second central '
+                             'moment')
+        tolerance = cls._m2_tolerance(m2, weight * mean * mean)
+        if m2 < 0.0:
+            if m2 >= -tolerance:
+                m2 = 0.0
+            else:
+                raise ValueError('shard has negative second central moment')
+        return weight, mean, m2
+
+    def merge(self, other):
+        """Merge another moment accumulator into this one in place."""
+        other_weight, other_mean, other_m2 = self._state_from(other)
+        if other_weight == 0.0:
+            return self
+
+        old_weight = self._total_weight
+        if old_weight == 0.0:
+            new_weight = other_weight
+            new_mean = other_mean
+            new_m2 = other_m2
+        else:
+            new_weight = old_weight + other_weight
+            delta = other_mean - self._mean
+            new_mean = self._mean + delta * other_weight / new_weight
+            cross_moment = (delta * delta * old_weight * other_weight
+                            / new_weight)
+            new_m2 = self._m2 + other_m2 + cross_moment
+            tolerance = self._m2_tolerance(self._m2, other_m2,
+                                           cross_moment)
+            if new_m2 < 0.0:
+                if new_m2 < -tolerance:
+                    raise ValueError('merge produced a negative second '
+                                     'central moment: %r' % new_m2)
+                new_m2 = 0.0
+
+        if not (isfinite(new_weight) and isfinite(new_mean)
+                and isfinite(new_m2)):
+            raise ValueError('merge produced non-finite state')
+        if new_m2 < 0.0:
+            raise ValueError('merge produced a negative second central '
+                             'moment: %r' % new_m2)
+
+        self._total_weight = new_weight
+        self._mean = new_mean
+        self._m2 = new_m2
+        return self
+
+    def merged(self, *others):
+        """Return a new accumulator containing this object and *others*."""
+        combined = self.copy()
+        for other in others:
+            combined.merge(other)
+        return combined
+
+    @classmethod
+    def from_shards(cls, shards):
+        """Merge zero or more shards without storing their samples."""
+        combined = cls()
+        for shard in shards:
+            combined.merge(shard)
+        return combined
+
+    merge_shards = from_shards
+
+    def merge_all(self, others):
+        """Merge an iterable of shards into this accumulator."""
+        for other in others:
+            self.merge(other)
+        return self
+
+    def remove(self, value, weight=1.0):
+        """Remove a previously included weighted sample.
+
+        The caller is responsible for passing a sample that was actually
+        added. Aggregate moments alone cannot identify unknown samples.
+        """
+        value, weight = self._sample(value, weight)
+        current_weight = self._total_weight
+        if weight == 0.0:
+            return self
+
+        weight_tolerance = (self._EPSILON
+                            * max(1.0, current_weight, weight))
+        old_weight = current_weight - weight
+        delta = value - self._mean
+
+        if old_weight < 0.0:
+            if old_weight < -weight_tolerance:
+                raise ValueError('cannot remove weight %r from total '
+                                 'weight %r' % (weight, current_weight))
+            old_weight = 0.0
+        elif old_weight <= weight_tolerance:
+            old_weight = 0.0
+
+        if old_weight == 0.0:
+            final_m2 = self._m2 - current_weight * delta * delta
+            final_scale = max(abs(self._mean), abs(value), 1.0)
+            reset_tolerance = self._EPSILON
+            reset_tolerance += (8.0 * current_weight * final_scale
+                                * abs(delta) * sys.float_info.epsilon)
+            reset_tolerance += self._m2_tolerance(
+                self._m2, current_weight * delta * delta)
+            if final_m2 < -reset_tolerance:
+                raise ValueError('removal produced a negative second '
+                                 'central moment: %r' % final_m2)
+            self._reset()
+            return self
+
+        correction = (weight * current_weight / old_weight) * delta * delta
+        old_mean = self._mean - (weight / old_weight) * delta
+        old_m2 = self._m2 - correction
+        removal_scale = (current_weight
+                         * max(abs(self._mean), abs(value), 1.0)
+                         * max(abs(delta), abs(old_mean), 1.0))
+        tolerance = (1e-4 * removal_scale
+                     + self._m2_tolerance(self._m2, correction))
+        if old_m2 < 0.0:
+            if old_m2 < -tolerance:
+                raise ValueError('removal produced a negative second '
+                                 'central moment: %r' % old_m2)
+            old_m2 = 0.0
+
+        if not (isfinite(old_weight) and isfinite(old_mean)
+                and isfinite(old_m2)):
+            raise ValueError('removal produced non-finite state')
+
+        self._total_weight = old_weight
+        self._mean = old_mean
+        self._m2 = old_m2
+        return self
+
+    def copy(self):
+        """Return an independent copy of this accumulator."""
+        copied = type(self)()
+        copied._total_weight = self._total_weight
+        copied._mean = self._mean
+        copied._m2 = self._m2
+        return copied
+
+    def variance(self, ddof=0):
+        """Return variance with delta degrees of freedom.
+
+        ``ddof=0`` selects population variance (``m2 / W``), while
+        ``ddof=1`` selects frequency-weight sample variance
+        (``m2 / (W - 1)``).
+        """
+        denominator = self._total_weight - ddof
+        if denominator <= 0.0:
+            raise ValueError('variance requires total weight greater than '
+                             'ddof')
+        return self._m2 / denominator
+
+    def population_variance(self):
+        """Return ``m2 / total_weight``."""
+        return self.variance(ddof=0)
+
+    pvariance = population_variance
+
+    def sample_variance(self):
+        """Return ``m2 / (total_weight - 1)`` for frequency weights."""
+        return self.variance(ddof=1)
+
+    svariance = sample_variance
+
+    def std_dev(self, ddof=0):
+        """Square root of :meth:`variance`."""
+        return self.variance(ddof=ddof) ** 0.5
+
+    def __repr__(self):
+        return ('%s(total_weight=%r, mean=%r, m2=%r)'
+                % (type(self).__name__, self._total_weight,
+                   self._mean, self._m2))
+
+
+WeightedStats = OnlineWeightedStats
 
 
 def describe(data, quantiles=None, format=None):
