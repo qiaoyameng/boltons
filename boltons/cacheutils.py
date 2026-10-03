@@ -639,12 +639,14 @@ class cachedproperty:
 
 class ThresholdCounter:
     """A **bounded** dict-like Mapping from keys to counts. The
-    ThresholdCounter automatically compacts after every (1 /
-    *threshold*) additions, maintaining exact counts for any keys
-    whose count represents at least a *threshold* ratio of the total
-    data. In other words, if a particular key is not present in the
-    ThresholdCounter, its count represents less than *threshold* of
-    the total data.
+    ThresholdCounter compacts after every ``int(1 / threshold)``
+    additions. Let *width* be that bucket width and *b* be the number
+    of completed buckets (``total // width``). Each retained key
+    stores ``[count, error]``; its true count is between ``count``
+    and ``count + error``, while a missing key's true count is
+    between ``0`` and *b*. Consequently, any key whose true count is
+    greater than *b* is retained. Use :meth:`get_count_bounds` to
+    query either case.
 
     >>> tc = ThresholdCounter(threshold=0.1)
     >>> tc.add(1)
@@ -679,6 +681,22 @@ class ThresholdCounter:
     Streams" by Manku & Motwani. Hat tip to Kurt Rose for discovery
     and initial implementation.
 
+    Two counters with the same threshold can be combined with
+    :meth:`merge` without replaying their retained elements or
+    modifying either input. The result represents the multiset union
+    of the summarized events and immediately applies the same
+    compaction bound at the combined :attr:`total`. Because the
+    compaction boundary depends on event order, a merged counter does
+    not have to retain exactly the same keys as a counter that
+    processed the concatenated streams one event at a time; both
+    summaries satisfy the same bounds.
+
+    The absolute per-key error is at most *b* (``total // width``);
+    for reciprocal thresholds such as ``0.01`` this is approximately
+    *threshold* times the total. ``total`` is the exact number of
+    events represented by the counter, including events belonging to
+    keys that were later culled.
+
     """
     # TODO: hit_count/miss_count?
     def __init__(self, threshold=0.001):
@@ -695,6 +713,50 @@ class ThresholdCounter:
     @property
     def threshold(self):
         return self._threshold
+
+    def merge(self, other):
+        """Return a new counter containing the multiset union of this
+        counter and *other*.
+
+        Both counters must use the same threshold. Neither input is
+        modified, and the retained elements are not expanded to replay
+        events. A key missing from one summary can have been culled
+        there, so that summary's completed-bucket bound is included in
+        the key's error allowance.
+        """
+        if not isinstance(other, ThresholdCounter):
+            raise TypeError('expected ThresholdCounter, not %r'
+                            % type(other))
+        if self._threshold != other._threshold:
+            raise ValueError('cannot merge thresholds %r and %r'
+                             % (self._threshold, other._threshold))
+
+        merged = type(self)(self._threshold)
+        merged.total = self.total + other.total
+        merged._cur_bucket = merged.total // merged._thresh_count + 1
+
+        completed_buckets = merged._cur_bucket - 1
+        self_buckets = self._cur_bucket - 1
+        other_buckets = other._cur_bucket - 1
+        count_map = {}
+        for key in set(self._count_map) | set(other._count_map):
+            self_entry = self._count_map.get(key)
+            other_entry = other._count_map.get(key)
+            if self_entry is None:
+                self_count, self_error = 0, self_buckets
+            else:
+                self_count, self_error = self_entry
+            if other_entry is None:
+                other_count, other_error = 0, other_buckets
+            else:
+                other_count, other_error = other_entry
+            count = self_count + other_count
+            error = self_error + other_error
+            if count + error > completed_buckets:
+                count_map[key] = [count, error]
+
+        merged._count_map = count_map
+        return merged
 
     def add(self, key):
         """Increment the count of *key* by 1, automatically adding it if it
@@ -713,6 +775,21 @@ class ThresholdCounter:
                                     if sum(v) > self._cur_bucket}
             self._cur_bucket += 1
         return
+
+    def get_count_bounds(self, key):
+        """Return the ``(lower, upper)`` bounds for the true count of
+        *key*.
+
+        The lower bound is the retained count, or zero for a key that
+        is currently absent. The upper bound includes occurrences that
+        may have been culled, so an absent key is never treated as if
+        it never occurred.
+        """
+        try:
+            count, error = self._count_map[key]
+        except KeyError:
+            return (0, self._cur_bucket - 1)
+        return (count, count + error)
 
     def elements(self):
         """Return an iterator of all the common elements tracked by the

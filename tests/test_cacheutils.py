@@ -3,6 +3,8 @@ import sys
 from abc import abstractmethod, ABCMeta
 
 import pytest
+from collections import Counter
+from random import Random
 
 from boltons.cacheutils import LRU, LRI, cached, cachedmethod, cachedproperty, MinIDMap, ThresholdCounter
 
@@ -507,6 +509,144 @@ def test_threshold_counter_update_mapping_compaction():
     assert dict(tc.items()) == dict(expected.items())
     assert tc.total == expected.total == 16
     assert tc.get_uncommon_count() == expected.get_uncommon_count()
+
+
+def test_threshold_counter_get_count_bounds():
+    tc = ThresholdCounter(threshold=0.1)
+    for i in range(10):
+        tc.add(i)
+
+    assert tc.get_count_bounds('missing') == (0, 1)
+
+    tc.add('survivor')
+    assert tc.get_count_bounds('survivor') == (1, 2)
+
+
+def test_threshold_counter_merge_immutable_and_threshold_check():
+    left = ThresholdCounter(threshold=0.1)
+    right = ThresholdCounter(threshold=0.1)
+    left.update({'a': 10, 'left-only': 6})
+    right.update({'a': 10, 'right-only': 6})
+
+    left_before = (left.total, left.items())
+    right_before = (right.total, right.items())
+    merged = left.merge(right)
+
+    assert (left.total, left.items()) == left_before
+    assert (right.total, right.items()) == right_before
+    assert merged.total == 32
+    assert merged.get('a') == 20
+
+    with pytest.raises(ValueError):
+        left.merge(ThresholdCounter(threshold=0.2))
+    with pytest.raises(TypeError):
+        left.merge(object())
+
+
+def test_threshold_counter_merge_preserves_culled_key_bounds():
+    threshold = 0.1
+    left = ThresholdCounter(threshold=threshold)
+    right = ThresholdCounter(threshold=threshold)
+    exact = Counter()
+
+    left.add('rare')
+    exact['rare'] += 1
+    left.add('gone')
+    exact['gone'] += 1
+    for i in range(9):
+        key = f'left-only-{i}'
+        left.add(key)
+        exact[key] += 1
+
+    right.add('gone')
+    exact['gone'] += 1
+    for _ in range(9):
+        right.add('right-only')
+        exact['right-only'] += 1
+    right.add('rare')
+    exact['rare'] += 1
+
+    merged = left.merge(right)
+
+    assert merged.total == sum(exact.values())
+    assert merged.get_count_bounds('gone') == (0, 2)
+    for key, true_count in exact.items():
+        lower, upper = merged.get_count_bounds(key)
+        assert lower <= true_count <= upper
+
+
+def test_threshold_counter_merge_add_and_remerge_bounds():
+    threshold = 0.1
+    shards = [ThresholdCounter(threshold=threshold) for _ in range(3)]
+    exact = Counter()
+
+    events = [
+        ('common', 24, 0),
+        ('common', 24, 1),
+        ('common', 18, 2),
+        ('shard-rare', 12, 0),
+        ('shard-rare', 7, 2),
+    ]
+    for key, count, shard_index in events:
+        for _ in range(count):
+            shards[shard_index].add(key)
+            exact[key] += 1
+
+    for i in range(60):
+        shards[i % 3].add(str(i))
+        exact[str(i)] += 1
+
+    merged = shards[0].merge(shards[1]).merge(shards[2])
+    for key, true_count in exact.items():
+        lower, upper = merged.get_count_bounds(key)
+        assert lower <= true_count <= upper
+
+    for _ in range(15):
+        merged.add('common')
+        exact['common'] += 1
+    for _ in range(5):
+        merged.add('new-after-merge')
+        exact['new-after-merge'] += 1
+
+    another = ThresholdCounter(threshold=threshold)
+    for _ in range(12):
+        another.add('common')
+        exact['common'] += 1
+    another.add('another-rare')
+    exact['another-rare'] += 1
+
+    remerged = merged.merge(another)
+
+    assert remerged.total == sum(exact.values())
+    assert 'common' in remerged
+    for key, true_count in exact.items():
+        lower, upper = remerged.get_count_bounds(key)
+        assert lower <= true_count <= upper
+
+
+def test_threshold_counter_merge_randomized_against_exact_counter():
+    threshold = 0.1
+    shards = [ThresholdCounter(threshold=threshold) for _ in range(4)]
+    exact = Counter()
+
+    rng = Random(7)
+    keys = ['common', 'secondary', 'tail-a', 'tail-b', 'tail-c', 'tail-d']
+    weights = [0.34, 0.22, 0.11, 0.11, 0.11, 0.11]
+    for shard in shards:
+        for _ in range(97):
+            key = rng.choices(keys, weights=weights)[0]
+            shard.add(key)
+            exact[key] += 1
+
+    merged = shards[0].merge(shards[1]).merge(shards[2]).merge(shards[3])
+    assert merged.total == sum(exact.values())
+
+    error_bound = merged.total // merged._thresh_count
+    for key in set(exact) | set(merged.keys()) | {'never-seen'}:
+        lower, upper = merged.get_count_bounds(key)
+        true_count = exact[key]
+        assert lower <= true_count <= upper
+        assert upper - lower <= error_bound
 
 
 @pytest.mark.parametrize('cache_type', [LRI, LRU])
