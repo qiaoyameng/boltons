@@ -252,6 +252,186 @@ def test_iset_slice_after_removal():
     assert isinstance(x[1:4], IndexedSet)
 
 
+def reference_move_range(values, start, stop, destination):
+    length = len(values)
+
+    def normalize(index):
+        index = int(index)
+        if index < 0:
+            index += length
+        if not 0 <= index <= length:
+            raise IndexError
+        return index
+
+    start = normalize(start)
+    stop = normalize(stop)
+    destination = normalize(destination)
+    if start <= destination <= stop:
+        return
+    moved = values[start:stop]
+    del values[start:stop]
+    insert_at = (destination if destination < start
+                 else destination - len(moved))
+    values[insert_at:insert_at] = moved
+
+
+def test_indexed_set_move_range():
+    cases = [
+        ((2, 5, 0), [2, 3, 4, 0, 1, 5, 6, 7, 8, 9]),
+        ((2, 5, 2), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ((2, 5, 5), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ((2, 5, 6), [0, 1, 5, 2, 3, 4, 6, 7, 8, 9]),
+        ((2, 5, 10), [0, 1, 5, 6, 7, 8, 9, 2, 3, 4]),
+        ((-5, -2, 0), [5, 6, 7, 0, 1, 2, 3, 4, 8, 9]),
+        ((-5, -2, -5), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ((-5, -2, -1), [0, 1, 2, 3, 4, 8, 5, 6, 7, 9]),
+        ((4, 4, 0), list(range(10))),
+        ((4, 4, 10), list(range(10))),
+        ((5, 2, 0), list(range(10))),
+        ((0, 10, 0), list(range(10))),
+        ((0, 10, 10), list(range(10))),
+        ((0, 5, 10), [5, 6, 7, 8, 9, 0, 1, 2, 3, 4]),
+    ]
+
+    for args, expected in cases:
+        iset = IndexedSet(range(10))
+        assert iset.move_range(*args) is None
+        assert list(iset) == expected, args
+
+
+def test_indexed_set_move_range_identity_and_membership():
+    values = [object() for _ in range(10)]
+    iset = IndexedSet(values)
+    members = set(values)
+
+    iset.move_range(2, 5, 8)
+
+    after = list(iset)
+    expected_positions = [0, 1, 5, 6, 7, 2, 3, 4, 8, 9]
+    assert [values.index(item) for item in after] == expected_positions
+    assert set(after) == members
+    assert all(item is values[expected]
+               for expected, item in zip(expected_positions, after))
+    assert all(iset.index(item) == index for index, item in enumerate(after))
+    assert iset.item_index_map == {item: i for i, item in enumerate(after)}
+
+
+def test_indexed_set_move_range_bounds():
+    iset = IndexedSet(range(10))
+
+    with raises(IndexError):
+        iset.move_range(11, 12, 0)
+    with raises(IndexError):
+        iset.move_range(0, 11, 0)
+    with raises(IndexError):
+        iset.move_range(0, 1, 11)
+    with raises(IndexError):
+        iset.move_range(-11, 0, 0)
+    with raises(IndexError):
+        iset.move_range(0, -11, 0)
+    with raises(IndexError):
+        iset.move_range(0, 1, -11)
+    assert list(iset) == list(range(10))
+
+
+def test_indexed_set_move_range_with_dead_slots():
+    iset = IndexedSet(range(100))
+    ref = list(range(100))
+    removed = [1, 8, 17, 26, 35, 44, 53, 62, 71, 80]
+
+    for value in removed:
+        iset.remove(value)
+        ref.remove(value)
+
+    assert iset._dead_index_count == len(removed)
+    assert list(iset) == ref
+
+    iset.move_range(10, 30, 20)
+    assert iset._dead_index_count == len(removed)
+    assert list(iset) == ref
+
+    iset.move_range(10, 30, 60)
+    reference_move_range(ref, 10, 30, 60)
+
+    assert iset.dead_indices == []
+    assert list(iset) == ref
+    assert all(iset.index(item) == index for index, item in enumerate(ref))
+    assert all(iset[index] is item for index, item in enumerate(ref))
+
+
+def test_indexed_set_move_range_then_compaction():
+    iset = IndexedSet(range(100))
+    ref = list(range(100))
+
+    iset.move_range(20, 40, 80)
+    reference_move_range(ref, 20, 40, 80)
+
+    for value in range(0, 100, 8):
+        iset.discard(value)
+        try:
+            ref.remove(value)
+        except ValueError:
+            pass
+
+    assert list(iset) == ref
+    assert all(iset[index] is item for index, item in enumerate(ref))
+
+
+def test_indexed_set_move_range_after_removals_and_sequence():
+    values = list(range(1000))
+    iset = IndexedSet(values)
+    ref = list(values)
+
+    iset.difference_update(set(range(0, 1000, 2)))
+    del ref[::2]
+    assert len(iset.dead_indices) == 0
+    assert list(iset) == ref
+
+    operations = [
+        (10, 80, 0),
+        (120, 125, len(ref)),
+        (200, 240, 200),
+        (200, 240, 240),
+        (200, 240, 241),
+        (-40, -10, 50),
+        (-40, -40, 0),
+        (150, 150, len(ref)),
+    ]
+
+    for start, stop, destination in operations:
+        iset.move_range(start, stop, destination)
+        reference_move_range(ref, start, stop, destination)
+        assert list(iset) == ref
+        assert len(iset) == len(ref)
+        assert set(iset) == set(ref)
+
+    popped_tail = iset.pop()
+    expected_tail = ref.pop()
+    assert popped_tail is expected_tail
+    assert popped_tail not in iset
+
+    popped = iset.pop(7)
+    expected_popped = ref.pop(7)
+    assert popped is expected_popped
+    assert popped not in iset
+
+    for index in (3, 27, 91):
+        removed = iset.pop(index)
+        expected_removed = ref.pop(index)
+        assert removed is expected_removed
+
+    assert iset.index(ref[123]) == 123
+    assert iset[123] is ref[123]
+    assert list(iset[25:75:3]) == ref[25:75:3]
+    assert list(iset[:]) == ref
+    assert list(reversed(iset)) == list(reversed(ref))
+    new_item = object()
+    iset.update([new_item])
+    ref.append(new_item)
+    assert list(iset) == ref
+    assert iset[-1] is new_item
+
+
 def test_iset_slice_agreement():
     # Slicing must not depend on dead slots: a set with removals must slice
     # identically to a freshly-built set with the same contents (all steps,

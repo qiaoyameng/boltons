@@ -465,6 +465,47 @@ class IndexedSet(MutableSet):
             return 1
         return 0
 
+    @staticmethod
+    def _normalize_range_bound(bound, length):
+        bound = operator.index(bound)
+        if bound < 0:
+            bound += length
+        if bound < 0 or bound > length:
+            raise IndexError('IndexedSet index out of range')
+        return bound
+
+    def move_range(self, start, stop, destination):
+        """
+        move_range(start, stop, destination) -> None
+
+        Move the logical half-open range ``[start, stop)`` so that its
+        first element is at the logical insertion boundary ``destination``.
+        Negative indices count from the end. ``destination`` is interpreted
+        before the move; a boundary within the selected range leaves the
+        set unchanged. Returns ``None``. Raises :exc:`IndexError` if any
+        boundary is outside ``[0, len(self)]``.
+        """
+        length = len(self)
+        start = self._normalize_range_bound(start, length)
+        stop = self._normalize_range_bound(stop, length)
+        destination = self._normalize_range_bound(destination, length)
+        if start <= destination <= stop:
+            return None
+
+        values = list(self)
+        moved = values[start:stop]
+        del values[start:stop]
+        if destination < start:
+            insert_at = destination
+        else:
+            insert_at = destination - len(moved)
+        values[insert_at:insert_at] = moved
+
+        self.item_list = values
+        self.item_index_map = {item: i for i, item in enumerate(values)}
+        del self.dead_indices[:]
+        return None
+
     def reverse(self):
         "reverse() -> reverse the contents of the set in-place"
         reversed_list = list(reversed(self))
