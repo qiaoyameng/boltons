@@ -136,6 +136,108 @@ class TestRemap:
         assert remapped[0] is remapped[1]
         assert remapped[0] is not duperef[0]
 
+    def test_path_wise_shared_container(self):
+        # the same dict mounted under two entries, transformed with
+        # path-dependent visit logic
+        shared = {'secret': 'drop-me', 'keep': 1}
+        orig = {'public': shared, 'internal': shared}
+
+        def visit(path, key, value):
+            if path and path[0] == 'public' and key == 'secret':
+                return False
+            return key, value
+
+        remapped = remap(orig, visit=visit, path_wise=True)
+        assert remapped['public'] == {'keep': 1}
+        assert remapped['internal'] == {'secret': 'drop-me', 'keep': 1}
+        assert remapped['public'] is not remapped['internal']
+        # the source structure is untouched
+        assert orig['public'] is shared
+        assert orig['internal'] is shared
+        assert shared == {'secret': 'drop-me', 'keep': 1}
+
+        # the default mode dedupes by identity: both entries reuse the
+        # first traversal's result
+        remapped_cached = remap(orig, visit=visit)
+        assert remapped_cached['public'] is remapped_cached['internal']
+        assert remapped_cached['public'] == {'keep': 1}
+
+    def test_path_wise_shared_container_entered_per_path(self):
+        shared = [1, 2]
+        orig = {'a': shared, 'b': shared}
+        enter_calls = []
+
+        def enter(path, key, value):
+            if value is shared:
+                enter_calls.append(path + (key,))
+            return default_enter(path, key, value)
+
+        remapped = remap(orig, enter=enter, path_wise=True)
+        assert remapped == orig
+        assert remapped['a'] is not remapped['b']
+        assert sorted(enter_calls) == [('a',), ('b',)]
+
+    def test_path_wise_cross_cycle(self):
+        # a list and a dict referencing each other
+        lst = []
+        dct = {'lst': lst}
+        lst.append(dct)
+
+        remapped = remap(lst, path_wise=True)
+        assert remapped is not lst
+        assert isinstance(remapped, list)
+        new_dct = remapped[0]
+        assert new_dct is not dct
+        # back-edges connect to the containers built on this path
+        assert new_dct['lst'] is remapped
+        assert remapped[0] is new_dct
+        assert new_dct['lst'][0] is new_dct
+
+        # root self-reference still terminates and loops back
+        selfref = []
+        selfref.append(selfref)
+        remapped_selfref = remap(selfref, path_wise=True)
+        assert remapped_selfref is not selfref
+        assert remapped_selfref[0] is remapped_selfref
+
+    def test_path_wise_exit_replace_backref(self):
+        # a tuple ancestor with a back-edge to itself: the default
+        # exit replaces the blank tuple, which would leave the
+        # back-edge pointing at the discarded, partially-built object
+        inner = []
+        tpl = (inner,)
+        inner.append(tpl)
+
+        with pytest.raises(RuntimeError):
+            remap(tpl, path_wise=True)
+
+        # in-place exits (lists, dicts, sets) with back-edges are fine
+        lst = []
+        lst.append({'loop': lst})
+        remapped = remap(lst, path_wise=True)
+        assert remapped[0]['loop'] is remapped
+
+    def test_path_wise_visit_failure_source_intact(self):
+        cyc = []
+        cyc.append(cyc)
+        orig = {'cyc': cyc, 'data': {'drop': 1}}
+
+        def visit(path, key, value):
+            if key == 'drop':
+                raise ValueError('boom')
+            return key, value
+
+        with pytest.raises(ValueError):
+            remap(orig, visit=visit, path_wise=True)
+
+        # the source object is unharmed and still fully remappable
+        assert orig['cyc'][0] is cyc
+        assert orig['data'] == {'drop': 1}
+        remapped = remap(orig, path_wise=True)
+        assert remapped['cyc'] is not cyc
+        assert remapped['cyc'][0] is remapped['cyc']
+        assert remapped['data'] == {'drop': 1}
+
     def test_namedtuple(self):
         """TODO: this fails right now because namedtuples' __new__ is
         overridden to accept arguments. remap's default_enter tries

@@ -1101,6 +1101,7 @@ def remap(
         enter=default_enter,
         exit=default_exit,
         cache: bool = True,
+        path_wise: bool = False,
         **kwargs,
 ):
     """The remap ("recursive map") function is used to traverse and
@@ -1180,6 +1181,23 @@ def remap(
             objects. Uses object identity for the cache. For example
             this is turned off for applications like `research` which
             need to traverse all trees.
+        path_wise (bool): Controls whether shared containers are
+            expanded per path. When ``True``, remap keeps only an
+            *ancestor registry*: a container is deduplicated while it
+            is on the current path (i.e., an ancestor of the item
+            being processed), and is traversed again from scratch
+            every time it is reached from a different path. This
+            means a container shared by two parents (e.g., the same
+            dict mounted under a ``public`` and an ``internal``
+            entry) is transformed once per path, so path-dependent
+            *visit* logic shapes each occurrence independently.
+            References back to an ancestor (self-references and other
+            reference loops) are still detected: the back-reference
+            is connected to the new container currently being
+            constructed for that ancestor, and the ancestor is never
+            re-entered. Defaults to ``False``, which preserves the
+            global identity cache controlled by *cache*. When
+            ``True``, *path_wise* takes precedence over *cache*.
         reraise_visit (bool): A pragmatic convenience for the *visit*
             callable. When set to ``False``, remap ignores any errors
             raised by the *visit* callback. Items causing exceptions
@@ -1201,6 +1219,17 @@ def remap(
 
     Duplicate and self-referential objects (aka reference loops) are
     automatically handled internally, `as shown here`_.
+
+    When *path_wise* is enabled, back-references point at the new
+    parent object returned by *enter* while that object is still
+    being built. If *exit* then replaces the constructed object --
+    returning a different object than the new parent it was passed,
+    as the default exit does for tuples and frozensets -- and any
+    back-references to it were emitted on the current path, remap
+    raises :exc:`RuntimeError` instead of silently leaving the
+    discarded, partially-built container wired into the result.
+    Containers which *exit* updates in place (the default behavior
+    for lists, dicts, and sets) are unaffected.
 
     .. _this example: http://sedimental.org/remap.html#sort_all_lists
     .. _as shown here: http://sedimental.org/remap.html#corner_cases
@@ -1229,6 +1258,7 @@ def remap(
 
     path, registry, stack = (), {}, [(None, root)]
     new_items_stack = []
+    backref_counts = {}  # id -> int, only maintained when path_wise=True
     while stack:
         key, value = stack.pop()
         id_value = id(value)
@@ -1242,11 +1272,35 @@ def remap(
             value = exit(path, key, old_parent, new_parent, new_items)
             if trace_exit:
                 print(' .. remap exit result:', value)
-            registry[id_value] = value
+            if path_wise:
+                # this ancestor is no longer under construction, so
+                # future occurrences get a fresh traversal.
+                del registry[id_value]
+                backref_count = backref_counts.pop(id_value, 0)
+                if backref_count and value is not new_parent:
+                    raise RuntimeError(
+                        'remap(path_wise=True): exit() returned a new'
+                        ' object to replace the container at path %r,'
+                        ' but %d back-reference(s) to the container'
+                        ' under construction were already emitted on'
+                        ' this path. Replacing the container would'
+                        ' silently leave those references pointing at'
+                        ' the discarded, partially-built object. Use'
+                        ' an exit() which updates the new parent in'
+                        ' place, or restructure the data to avoid'
+                        ' back-references to replaced containers.'
+                        % (path + (key,), backref_count))
+            else:
+                registry[id_value] = value
             if not new_items_stack:
                 continue
-        elif cache and id_value in registry:
+        elif id_value in registry and (cache or path_wise):
             value = registry[id_value]
+            if path_wise:
+                # a back-reference to an ancestor still under
+                # construction: connect to its in-progress new parent
+                # without re-entering it.
+                backref_counts[id_value] += 1
         else:
             if trace_enter:
                 print(' .. remap enter:', path, '-', key, '-', value)
@@ -1262,6 +1316,8 @@ def remap(
             if new_items is not False:
                 # traverse unless False is explicitly passed
                 registry[id_value] = new_parent
+                if path_wise:
+                    backref_counts[id_value] = 0
                 new_items_stack.append((path, []))
                 if value is not root:
                     path += (key,)
