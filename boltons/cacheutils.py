@@ -679,6 +679,27 @@ class ThresholdCounter:
     Streams" by Manku & Motwani. Hat tip to Kurt Rose for discovery
     and initial implementation.
 
+    Guarantees, in terms of the true count ``f`` of a key (the number
+    of times it was added):
+
+    * Retention: every key with ``f > cur_error`` (see below) is
+      present in the counter, and its stored count ``c`` satisfies
+      ``c <= f <= c + delta``, where ``delta`` is the per-key error
+      term tracked internally. Use :meth:`get_count_bounds` to query
+      this interval.
+    * Error: for any key, present or not, ``f`` is known to within
+      ``cur_error = self._cur_bucket - 1``, which never exceeds
+      ``total / int(1 / threshold)`` (roughly ``threshold * total``).
+      A key absent from the counter has ``0 <= f <= cur_error``; its
+      absence must not be read as "never seen".
+    * ``total`` is always the exact number of :meth:`add` calls (or
+      the sum of the totals of merged counters); only the per-key
+      counts are approximate.
+
+    Counters from independent shards processing the same stream can be
+    combined with :meth:`merge`, which preserves all of the guarantees
+    above without replaying the original events.
+
     """
     # TODO: hit_count/miss_count?
     def __init__(self, threshold=0.001):
@@ -792,6 +813,74 @@ class ThresholdCounter:
             return self[key]
         except KeyError:
             return default
+
+    def get_count_bounds(self, key):
+        """Get a ``(lower, upper)`` tuple bounding the true count of
+        *key*, i.e. the number of times *key* was actually added.
+
+        For a tracked key, ``lower`` is the stored count and ``upper``
+        is the stored count plus the key's remaining error term. For a
+        key which is not tracked (culled by compaction or never
+        added), the bounds are ``(0, cur_error)``, where ``cur_error``
+        is the counter's current maximum error, at most
+        ``total / int(1 / threshold)``. In other words, a missing key
+        may still have been added up to ``cur_error`` times.
+        """
+        try:
+            count, delta = self._count_map[key]
+            return (count, count + delta)
+        except KeyError:
+            return (0, self._cur_bucket - 1)
+
+    def merge(self, other):
+        """Return a new :class:`ThresholdCounter` combining the
+        summaries of this counter and *other*, as if both had counted
+        the same logical stream. Neither input counter is modified.
+
+        *other* must be a ThresholdCounter with the same
+        :attr:`threshold`; a :exc:`ValueError` is raised otherwise.
+
+        The merged counter's ``total`` is the exact sum of both
+        inputs' totals. Per-key counts and error terms are summed,
+        with keys missing from one side inheriting that side's maximum
+        error, so the retention and error guarantees described in the
+        class docstring continue to hold. The merged counter supports
+        further :meth:`add`, :meth:`merge`, and automatic compaction
+        under the same guarantees, though the exact set of retained
+        keys may differ from a counter fed the same events serially.
+        """
+        if not isinstance(other, ThresholdCounter):
+            raise TypeError('expected ThresholdCounter instance, not: %r'
+                            % other)
+        if self.threshold != other.threshold:
+            raise ValueError('expected matching thresholds, not: %r and %r'
+                             % (self.threshold, other.threshold))
+
+        ret = ThresholdCounter(threshold=self.threshold)
+        ret.total = self.total + other.total
+        ret._cur_bucket = self._cur_bucket + other._cur_bucket - 1
+
+        count_map = {}
+        for key, (count, delta) in self._count_map.items():
+            count_map[key] = [count, delta]
+        for key, (count, delta) in other._count_map.items():
+            entry = count_map.get(key)
+            if entry is None:
+                count_map[key] = [count, delta]
+            else:
+                entry[0] += count
+                entry[1] += delta
+        # keys absent from one side may have been culled there, so
+        # they inherit that side's maximum error as additional delta
+        self_error = self._cur_bucket - 1
+        other_error = other._cur_bucket - 1
+        for key, entry in count_map.items():
+            if key not in self._count_map:
+                entry[1] += self_error
+            if key not in other._count_map:
+                entry[1] += other_error
+        ret._count_map = count_map
+        return ret
 
     def update(self, iterable, **kwargs):
         """Like dict.update() but add counts instead of replacing them, used

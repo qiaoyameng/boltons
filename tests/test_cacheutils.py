@@ -509,6 +509,121 @@ def test_threshold_counter_update_mapping_compaction():
     assert tc.get_uncommon_count() == expected.get_uncommon_count()
 
 
+def _assert_bounds_match_exact(tc, exact):
+    assert tc.total == sum(exact.values())
+    max_error = tc.total // tc._thresh_count
+    for key, true_count in exact.items():
+        lower, upper = tc.get_count_bounds(key)
+        assert lower <= true_count <= upper
+        assert upper - lower <= max_error
+        if true_count > tc._cur_bucket - 1:
+            assert key in tc
+    for key in tc.iterkeys():
+        lower, upper = tc.get_count_bounds(key)
+        assert lower == tc[key]
+        assert lower <= exact.get(key, 0) <= upper
+
+
+def test_threshold_counter_get_count_bounds():
+    tc = ThresholdCounter(threshold=0.1)
+    tc.update(['a'] * 25 + ['b'] * 5)
+
+    lower, upper = tc.get_count_bounds('a')
+    assert lower == tc['a']
+    assert lower <= 25 <= upper
+
+    # a key which was never added (or was culled) is bounded, not zeroed
+    miss_lower, miss_upper = tc.get_count_bounds('missing')
+    assert miss_lower == 0
+    assert miss_upper == tc._cur_bucket - 1
+    assert miss_upper <= tc.total // tc._thresh_count
+
+
+def test_threshold_counter_merge_exact_small():
+    from collections import Counter
+    stream = (['a'] * 30 + ['b'] * 20 + ['c'] * 9 + ['d'] * 2 + ['e'])
+    exact = Counter(stream)
+
+    left = ThresholdCounter(threshold=0.1)
+    right = ThresholdCounter(threshold=0.1)
+    left.update(stream[:31])
+    right.update(stream[31:])
+
+    merged = left.merge(right)
+    assert merged.total == len(stream)
+    _assert_bounds_match_exact(merged, exact)
+
+
+def test_threshold_counter_merge_does_not_modify_inputs():
+    left = ThresholdCounter(threshold=0.1)
+    right = ThresholdCounter(threshold=0.1)
+    left.update(['a'] * 30 + ['b'] * 15)
+    right.update(['a'] * 5 + ['c'] * 40)
+
+    left_state = (left.total, sorted(left.items()),
+                  {k: list(v) for k, v in left._count_map.items()})
+    right_state = (right.total, sorted(right.items()),
+                   {k: list(v) for k, v in right._count_map.items()})
+
+    merged = left.merge(right)
+
+    assert (left.total, sorted(left.items()),
+            {k: list(v) for k, v in left._count_map.items()}) == left_state
+    assert (right.total, sorted(right.items()),
+            {k: list(v) for k, v in right._count_map.items()}) == right_state
+    assert merged is not left and merged is not right
+
+
+def test_threshold_counter_merge_threshold_mismatch():
+    tc = ThresholdCounter(threshold=0.1)
+    other = ThresholdCounter(threshold=0.01)
+    with pytest.raises(ValueError):
+        tc.merge(other)
+    with pytest.raises(TypeError):
+        tc.merge({'a': 1})
+
+
+def test_threshold_counter_merge_shards_multiple_compactions():
+    from collections import Counter
+    import random
+
+    rng = random.Random(20261003)
+    threshold = 0.05  # compacts every 20 adds
+    keys = ['k%d' % i for i in range(30)]
+    weights = [rng.random() ** 3 for _ in keys]
+
+    shards, exact = [], Counter()
+    for _ in range(5):
+        shard_stream = rng.choices(keys, weights=weights, k=97)
+        exact.update(shard_stream)
+        tc = ThresholdCounter(threshold=threshold)
+        tc.update(shard_stream)
+        shards.append(tc)
+
+    # every shard went through several compaction cycles on its own
+    assert all(tc._cur_bucket > 2 for tc in shards)
+
+    merged = shards[0]
+    for shard in shards[1:]:
+        merged = merged.merge(shard)
+
+    _assert_bounds_match_exact(merged, exact)
+
+    # continued adds (and their compactions) keep the same bounds
+    extra = rng.choices(keys, weights=weights, k=211)
+    exact.update(extra)
+    merged.update(extra)
+    _assert_bounds_match_exact(merged, exact)
+
+    # re-merging an already-merged counter still holds the bounds
+    late_stream = rng.choices(keys, weights=weights, k=143)
+    exact.update(late_stream)
+    late = ThresholdCounter(threshold=threshold)
+    late.update(late_stream)
+    remerged = merged.merge(late)
+    _assert_bounds_match_exact(remerged, exact)
+
+
 @pytest.mark.parametrize('cache_type', [LRI, LRU])
 def test_cache_update_optional_source(cache_type):
     cache = cache_type(values={'existing': 0})
